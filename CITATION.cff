@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "Structural Determinants of Non-Communicable Disease Mortality Across Countries"
+authors:
+  - family-names: Meshkovski
+    given-names: Nikola
+institution:
+  name: "Corvinus University of Budapest"
+  department: "Institute of Economics"
+year: 2025
+type: report
+keywords:
+  - non-communicable diseases
+  - NCD mortality
+  - quantile regression
+  - OLS regression
+  - structural determinants
+  - air pollution
+  - global health
+  - World Bank
+  - applied economics
+abstract: >
+  This paper examines structural determinants of premature NCD mortality across
+  183 countries using 2019 cross-sectional data. Applying OLS and quantile
+  regression, the study finds that GNI per capita, air pollution mortality,
+  and suicide rate are the most consistent predictors, with heterogeneous
+  effects across the NCD mortality distribution.

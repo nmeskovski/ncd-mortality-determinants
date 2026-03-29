@@ -1,0 +1,656 @@
+---
+title: "Structural Determinants of Non-Communicable Disease Mortality Across Countries"
+author:
+  - name: Nikola Meshkovski
+
+institute: Corvinus University of Budapest
+date: 2025-05-17
+
+format:
+  pdf:
+    latex-engine: xelatex
+
+fontsize: 12pt
+fontenc: "Times New Roman"
+
+number-sections: true
+
+execute:
+  eval: true      # Evaluate the code chunks
+  include: true   # Include chunk output in the document
+  echo: false     # Hide source code from rendered output
+  output: false   # Hide execution results (tables/plots shown selectively below)
+  warning: false  # Suppress warnings
+  message: false  # Suppress messages
+  cache: true     # Cache results to speed up re-renders
+---
+
+
+```{r}
+#| label: clean_env
+#| cache: false
+
+# Clear the environment at the start of each render to ensure reproducibility
+rm(list = ls())
+```
+
+
+```{r}
+#| label: packages
+
+# Auto-install and load all required packages.
+# Uses if(!require(...)) pattern to avoid errors on first-time setup.
+
+packages <- c(
+  "readxl",    # Reading Excel files
+  "dplyr",     # Data manipulation
+  "tidyr",     # Data reshaping (pivot_wider, pivot_longer)
+  "skimr",     # Quick summary statistics
+  "janitor",   # Cleaning column names (clean_names)
+  "ggplot2",   # Plotting
+  "corrplot",  # Correlation heatmaps
+  "writexl",   # Exporting Excel files
+  "car",       # VIF (Variance Inflation Factor) diagnostics
+  "quantreg",  # Quantile regression (rq)
+  "psych"      # Extended descriptive statistics (describe)
+)
+
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+
+```{r}
+#| label: setup_paths
+
+# All paths are relative to this .qmd file's location.
+# Place Data_dirty.xlsx in the same directory as this file before rendering.
+# Output files will be saved to an "outputs/" subfolder (created automatically).
+
+data_path  <- "Data_dirty.xlsx"
+output_dir <- "outputs"
+dir.create(output_dir, showWarnings = FALSE)
+```
+
+
+# Data Import
+
+```{r}
+#| label: data_import
+
+# Load the raw World Bank dataset.
+# The file is in a long format: each row is a (country, indicator, year) triplet.
+data <- read_excel(data_path)
+```
+
+
+# Data Cleaning and Transformation
+
+```{r}
+#| label: data_cleaning
+
+# Step 1: Keep only the country name, series name, and 2019 values.
+# We restrict to 2019 to ensure temporal consistency across all indicators.
+data_2019 <- data %>%
+  select(`Country Name`, `Series Name`, `2019 [YR2019]`)
+
+# Step 2: Reshape from long to wide format so each indicator becomes a column.
+data_final <- data_2019 %>%
+  pivot_wider(names_from = `Series Name`, values_from = `2019 [YR2019]`)
+
+# Step 3: Standardise column names (lowercase, underscores) using janitor.
+data_final_numeric <- clean_names(data_final)
+
+# Step 4: Convert all non-country columns to numeric.
+# Suppresses warnings for values that cannot be coerced (e.g. ".." placeholders).
+data_final_numeric <- data_final_numeric %>%
+  mutate(across(
+    where(is.character) & !any_of("country_name"),
+    ~ suppressWarnings(as.numeric(.))
+  ))
+```
+
+
+```{r}
+#| label: missing_values_summary
+
+# Inspect the proportion of missing values per variable.
+# Variables with very high missingness may need to be excluded later.
+missing_summary <- sapply(data_final_numeric, function(x) mean(is.na(x)))
+print(missing_summary)
+```
+
+
+```{r}
+#| label: further_cleaning
+
+# Step 5: Strip any residual non-numeric characters (%, spaces, commas) and
+# re-coerce to numeric. This handles formatting artefacts in the raw Excel file.
+cols_to_convert <- setdiff(names(data_final_numeric), "country_name")
+data_final_numeric[cols_to_convert] <- lapply(
+  data_final_numeric[cols_to_convert],
+  function(col) {
+    cleaned <- gsub("[% ,]", "", col)
+    as.numeric(cleaned)
+  }
+)
+
+# Step 6: Drop trailing aggregate/metadata columns added by the World Bank export.
+n <- ncol(data_final_numeric)
+cols_to_drop <- sort(unique(c(n, n - 2, n - 3, n - 4, n - 5)))
+data_final_numeric <- data_final_numeric[, -cols_to_drop]
+
+# Step 7: Assign human-readable column names aligned with the paper's variable list.
+names(data_final_numeric) <- c(
+  "country", "ncd_mortality_pct", "alcohol_per_capita", "gni_usd", "suicide_rate",
+  "pm2_5", "air_pollution_mort", "water_sanitation_mort", "safe_water_pct",
+  "ppp_water_invest", "basic_water_pct", "health_exp_gdp_pct", "health_exp_usd",
+  "health_exp_ppp", "gov_health_exp_gdp_pct", "gov_health_exp_usd",
+  "gov_health_exp_ppp", "hospital_beds", "oop_exp_pct", "oop_exp_ppp",
+  "oop_exp_usd", "gdp_ppp"
+)
+
+# Step 8: Remove observations with missing dependent variable (ncd_mortality_pct).
+# Also drop rows 184–231, which are regional/income-group aggregates, not countries.
+data_final_numeric <- data_final_numeric[!is.na(data_final_numeric$ncd_mortality_pct), ]
+data_final_numeric <- data_final_numeric[-c(184:231), ]
+```
+
+
+# Exploratory Analysis
+
+```{r}
+#| label: exploratory_plot
+
+# Quick scatter plot of GDP (PPP) vs NCD mortality to visualise the raw relationship
+# before any modelling. Expect a negative association (richer countries, lower mortality).
+ggplot(data_final_numeric, aes(x = gdp_ppp, y = ncd_mortality_pct)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", color = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "GDP (PPP) vs NCD Mortality — Raw Relationship",
+    x = "GDP per Capita (PPP, USD)",
+    y = "NCD Mortality (%)"
+  )
+```
+
+
+# Variable Selection and Multicollinearity Screening
+
+```{r}
+#| label: remove_redundant_vars
+
+# Drop redundant spending variables that overlap heavily with retained indicators.
+# These are alternative-currency versions of variables already captured elsewhere,
+# reducing dimensionality before the correlation analysis.
+vars_to_drop <- c(
+  "oop_exp_usd", "oop_exp_ppp",
+  "gov_health_exp_usd", "gov_health_exp_ppp",
+  "health_exp_usd", "health_exp_ppp"
+)
+
+data_ready <- data_final_numeric %>%
+  select(-all_of(vars_to_drop))
+```
+
+
+```{r}
+#| label: correlation_heatmap_full
+
+# Compute and visualise the full correlation matrix across remaining numeric variables.
+# This heatmap is used to identify candidate pairs for multicollinearity exclusion.
+numeric_data <- data_ready[sapply(data_ready, is.numeric)]
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+
+# Save correlation matrix for inspection
+write_xlsx(
+  as.data.frame(cor_matrix),
+  path = file.path(output_dir, "df_cor_matrix.xlsx")
+)
+
+corrplot(cor_matrix,
+  method = "color", type = "upper",
+  order = "hclust", tl.col = "black", tl.cex = 0.8,
+  col = colorRampPalette(c("red", "white", "blue"))(200)
+)
+```
+
+
+```{r}
+#| label: remove_high_corr_095
+
+# Automatically flag and remove variables with pairwise correlation > 0.95.
+# This strict threshold targets near-perfect collinearity that would severely
+# distort regression coefficients. The algorithm iterates column-by-column and
+# removes the second member of each highly correlated pair.
+cor_matrix2 <- cor(numeric_data, use = "complete.obs")
+high_corr <- abs(cor_matrix2) > 0.95
+diag(high_corr) <- FALSE
+
+to_remove <- c()
+for (i in seq_len(ncol(high_corr))) {
+  if (!(colnames(cor_matrix2)[i] %in% to_remove)) {
+    similar_vars <- which(high_corr[, i])
+    if (length(similar_vars) > 0) {
+      to_remove <- c(to_remove, colnames(cor_matrix2)[similar_vars])
+    }
+  }
+}
+to_remove <- unique(to_remove)
+
+filtered_data <- numeric_data %>% select(-all_of(to_remove))
+filtered_cor  <- cor(filtered_data, use = "complete.obs")
+
+corrplot(filtered_cor,
+  method = "color", type = "lower",
+  col = colorRampPalette(c("blue", "white", "red"))(200),
+  tl.cex = 0.8, tl.col = "black",
+  addCoef.col = "black", number.cex = 0.7,
+  mar = c(0, 0, 1, 0)
+)
+```
+
+
+```{r}
+#| label: remove_high_corr_075
+
+# Secondary check: flag pairs with correlation > 0.75 to understand moderate
+# collinearity. This does not automatically drop variables — it informs
+# the final variable selection judgement alongside VIF scores.
+high_corr_75 <- abs(cor_matrix2) > 0.75
+diag(high_corr_75) <- FALSE
+
+to_remove_75 <- c()
+for (i in seq_len(ncol(high_corr_75))) {
+  if (!(colnames(cor_matrix2)[i] %in% to_remove_75)) {
+    similar_vars <- which(high_corr_75[, i])
+    if (length(similar_vars) > 0) {
+      to_remove_75 <- c(to_remove_75, colnames(cor_matrix2)[similar_vars])
+    }
+  }
+}
+to_remove_75 <- unique(to_remove_75)
+
+filtered_data_75 <- numeric_data %>% select(-all_of(to_remove_75))
+filtered_cor_75  <- cor(filtered_data_75, use = "complete.obs")
+
+corrplot(filtered_cor_75,
+  method = "color", type = "lower",
+  col = colorRampPalette(c("blue", "white", "red"))(200),
+  tl.cex = 0.8, tl.col = "black",
+  addCoef.col = "black", number.cex = 0.7,
+  mar = c(0, 0, 1, 0)
+)
+```
+
+
+# Feature Engineering
+
+```{r}
+#| label: create_log_vars
+
+# Create log-transformed and rescaled versions of income/spending variables.
+# Log transforms reduce skewness from right-tailed distributions (income, spending).
+# GNI is scaled by 1,000 to make regression coefficients more interpretable
+# (a 1-unit change = $1,000 in GNI per capita).
+
+data_ready$log_health_exp_usd <- log(data_final_numeric$health_exp_usd)
+data_ready$log_gdp_ppp        <- log(data_final_numeric$gdp_ppp)
+data_ready$log_gni_usd        <- log(data_final_numeric$gdp_ppp)   # proxy via GDP
+data_ready$gni_usd_by1000     <- data_final_numeric$gdp_ppp / 1000
+data_ready$health_exp_usd     <- data_final_numeric$health_exp_usd
+```
+
+
+# Regression Modelling
+
+```{r}
+#| label: ols_models
+
+# Nine OLS specifications tested, ranging from a baseline single-predictor model
+# to a full socio-environmental model. Model selection is guided by BIC (see below).
+
+# MODEL 1 — Baseline: does absolute healthcare spending alone explain NCD mortality?
+model1 <- lm(ncd_mortality_pct ~ health_exp_usd, data = data_ready)
+summary(model1)
+
+# MODEL 2 — Adds GDP (PPP) to control for national income alongside health spending
+model2 <- lm(ncd_mortality_pct ~ health_exp_usd + gdp_ppp, data = data_ready)
+summary(model2)
+
+# MODEL 3 — Expands to include environmental (PM2.5) and out-of-pocket spending burden
+model3 <- lm(ncd_mortality_pct ~ health_exp_usd + gdp_ppp + pm2_5 + oop_exp_pct,
+             data = data_ready)
+summary(model3)
+
+# MODEL 4 — Log-linear version of Model 3 (diminishing returns on income and spending)
+model4 <- lm(ncd_mortality_pct ~ log_health_exp_usd + log_gdp_ppp + pm2_5 + oop_exp_pct,
+             data = data_ready)
+summary(model4)
+
+# MODEL 5 — Full socio-environmental model using GNI (SELECTED FINAL MODEL via BIC)
+# Combines alcohol consumption, national income, mental health burden (suicide rate),
+# ambient pollution (PM2.5), air pollution mortality, and access to safe water.
+model5 <- lm(ncd_mortality_pct ~ alcohol_per_capita + gni_usd_by1000 + suicide_rate +
+               pm2_5 + air_pollution_mort + safe_water_pct,
+             data = data_ready)
+summary(model5)
+
+# MODEL 6 — Same as Model 5 but substitutes GNI with GDP to check income proxy sensitivity
+model6 <- lm(ncd_mortality_pct ~ alcohol_per_capita + gdp_ppp + suicide_rate +
+               pm2_5 + air_pollution_mort + safe_water_pct,
+             data = data_ready)
+summary(model6)
+
+# MODEL 7.1 — Reduced Model 5: removes safe_water_pct to test its marginal contribution
+model7_1 <- lm(ncd_mortality_pct ~ alcohol_per_capita + gni_usd + suicide_rate +
+                 pm2_5 + air_pollution_mort,
+               data = data_ready)
+summary(model7_1)
+
+# MODEL 7.2 — Further reduction: drops suicide rate, leaves only core econ + enviro
+model7_2 <- lm(ncd_mortality_pct ~ alcohol_per_capita + gni_usd + pm2_5 + air_pollution_mort,
+               data = data_ready)
+summary(model7_2)
+
+# MODEL 8 — Hybrid: replaces raw spending with log-transformed version + core predictors
+model8 <- lm(ncd_mortality_pct ~ log_health_exp_usd + alcohol_per_capita + gni_usd +
+               pm2_5 + air_pollution_mort,
+             data = data_ready)
+summary(model8)
+```
+
+
+```{r}
+#| label: scatter_health_exp
+
+# Diagnostic scatter plot: visualise the linear fit of Model 1 (spending only)
+# to confirm the expected negative relationship before extending the model.
+ggplot(data_ready, aes(x = health_exp_usd, y = ncd_mortality_pct)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "blue") +
+  theme_minimal() +
+  labs(
+    title = "Health Expenditure vs. NCD Mortality",
+    x = "Health Expenditure per Capita (USD)",
+    y = "NCD Mortality (%)"
+  )
+```
+
+
+# Model Selection: BIC Ranking
+
+```{r}
+#| label: bic_ranking
+
+# Bayesian Information Criterion (BIC) penalises model complexity.
+# Lower BIC = better balance of fit and parsimony.
+# All nine candidate models are ranked; the model with the lowest BIC is selected.
+
+model_list <- list(
+  "Model 1 – Health Spending Only"         = model1,
+  "Model 2 – Spending + GDP"               = model2,
+  "Model 3 – Structural Factors"           = model3,
+  "Model 4 – Log-Linear Spending Model"    = model4,
+  "Model 5 – Full Socio-Enviro (GNI)"      = model5,
+  "Model 6 – Full Socio-Enviro (GDP)"      = model6,
+  "Model 7.1 – Reduced Socio-Enviro (No Water)" = model7_1,
+  "Model 7.2 – Core Predictors Only"       = model7_2,
+  "Model 8 – Log Spending + Core Drivers"  = model8
+)
+
+bic_values <- sapply(model_list, BIC)
+
+bic_table <- data.frame(Model = names(bic_values), BIC = round(bic_values, 2)) %>%
+  arrange(BIC) %>%
+  mutate(Rank = rank(BIC, ties.method = "first"))
+
+print(bic_table)
+
+write_xlsx(
+  as.data.frame(bic_table),
+  path = file.path(output_dir, "bic_table.xlsx")
+)
+```
+
+
+# Multicollinearity Diagnostics: VIF
+
+```{r}
+#| label: vif_flag_10
+
+# Variance Inflation Factor (VIF) measures how much a variable's variance is
+# inflated by collinearity with others. Conservative threshold used: VIF > 10.
+# Single-predictor models are excluded (VIF undefined with only one regressor).
+
+vif_eligible <- model_list[sapply(model_list, function(m) length(coef(m)) > 2)]
+
+vif_results_10 <- lapply(names(vif_eligible), function(name) {
+  vif_vals <- round(vif(vif_eligible[[name]]), 2)
+  data.frame(
+    Variable = names(vif_vals),
+    VIF      = vif_vals,
+    Model    = name,
+    Flag     = ifelse(vif_vals > 10, "⚠️ > 10", "")
+  )
+})
+
+vif_table_10 <- do.call(rbind, vif_results_10)
+vif_table_10 %>%
+  arrange(desc(VIF)) %>%
+  select(Model, Variable, VIF, Flag) %>%
+  print()
+```
+
+
+```{r}
+#| label: vif_flag_5
+
+# Stricter VIF check with threshold > 5, as used in the final paper.
+# Variables exceeding this threshold were excluded from the selected models.
+
+vif_results_5 <- lapply(names(vif_eligible), function(name) {
+  vif_vals <- round(vif(vif_eligible[[name]]), 2)
+  data.frame(
+    Variable = names(vif_vals),
+    VIF      = vif_vals,
+    Model    = name,
+    Flag     = ifelse(vif_vals > 5, "⚠️ > 5", "")
+  )
+})
+
+vif_table_5 <- do.call(rbind, vif_results_5)
+vif_table_5 %>%
+  arrange(desc(VIF)) %>%
+  select(Model, Variable, VIF, Flag) %>%
+  print(n = Inf)
+
+write_xlsx(
+  as.data.frame(vif_table_5),
+  path = file.path(output_dir, "vif_table.xlsx")
+)
+```
+
+
+# Final Model Diagnostics
+
+```{r}
+#| label: influence_plot
+
+# Influence plot for the selected final model (Model 5).
+# Identifies high-leverage and high-influence observations (potential outliers)
+# that may disproportionately affect regression estimates.
+influencePlot(model5)
+```
+
+
+```{r}
+#| label: final_model_results
+
+# Export OLS coefficient tables for Model 5 and Model 6 to Excel.
+# Model 5 (GNI) is the preferred specification; Model 6 (GDP) serves as a robustness check.
+
+model5_df <- as.data.frame(summary(model5)$coefficients)
+model6_df <- as.data.frame(summary(model6)$coefficients)
+
+write_xlsx(model5_df, path = file.path(output_dir, "ols_regression_model5.xlsx"))
+write_xlsx(model6_df, path = file.path(output_dir, "ols_regression_model6.xlsx"))
+
+summary(model5)
+summary(model6)
+```
+
+
+# Quantile Regression
+
+```{r}
+#| label: quantile_regression
+
+# OLS estimates the conditional mean; quantile regression estimates conditional
+# quantiles (25th, 50th, 75th percentiles here), revealing how predictor effects
+# differ across the NCD mortality distribution.
+# This is important because structural determinants may have heterogeneous effects
+# in low-burden vs. high-burden countries.
+
+qr25 <- rq(ncd_mortality_pct ~ alcohol_per_capita + gni_usd_by1000 + suicide_rate +
+             pm2_5 + air_pollution_mort + safe_water_pct,
+           tau = 0.25, data = data_ready)
+
+qr50 <- rq(ncd_mortality_pct ~ alcohol_per_capita + gni_usd_by1000 + suicide_rate +
+             pm2_5 + air_pollution_mort + safe_water_pct,
+           tau = 0.50, data = data_ready)
+
+qr75 <- rq(ncd_mortality_pct ~ alcohol_per_capita + gni_usd_by1000 + suicide_rate +
+             pm2_5 + air_pollution_mort + safe_water_pct,
+           tau = 0.75, data = data_ready)
+
+summary(qr25)
+summary(qr50)
+summary(qr75)
+
+# Fit across a fine grid of quantiles (0.1–0.9) and plot coefficient paths
+# to visualise how each predictor's effect shifts across the distribution.
+taus <- seq(0.1, 0.9, 0.1)
+qr_model <- rq(ncd_mortality_pct ~ alcohol_per_capita + gni_usd_by1000 + suicide_rate +
+                 pm2_5 + air_pollution_mort + safe_water_pct,
+               tau = taus, data = data_ready)
+plot(summary(qr_model))
+
+BIC(qr25, qr50, qr75)
+```
+
+
+```{r}
+#| label: quantile_coef_table
+
+# Combine the three quantile model coefficient vectors into a single comparison table.
+# The "Interpretation" column is added for readability in the paper.
+
+coefs_25 <- coef(qr25)
+coefs_50 <- coef(qr50)
+coefs_75 <- coef(qr75)
+
+coef_table <- data.frame(
+  Variable          = names(coefs_25),
+  `25th Percentile` = round(coefs_25, 4),
+  `50th Percentile` = round(coefs_50, 4),
+  `75th Percentile` = round(coefs_75, 4),
+  check.names = FALSE
+)
+
+coef_table$Interpretation <- c(
+  "Baseline NCD mortality at given quantile",
+  "Effect of alcohol consumption",
+  "Effect of GNI per capita",
+  "Effect of suicide rate",
+  "Effect of PM2.5 exposure",
+  "Effect of deaths from air pollution",
+  "Effect of access to safe water"
+)
+
+coef_table <- coef_table[, c(
+  "Variable", "Interpretation",
+  "25th Percentile", "50th Percentile", "75th Percentile"
+)]
+
+print(coef_table)
+
+write_xlsx(
+  as.data.frame(coef_table),
+  path = file.path(output_dir, "quantile_regression_coef_table.xlsx")
+)
+```
+
+
+```{r}
+#| label: quantile_coef_paths
+
+# Plot coefficient paths across quantiles τ = 0.10 to 0.90 for each predictor.
+# A flat line → uniform effect; a sloped line → effect grows/shrinks with NCD burden.
+
+taus_fine  <- seq(0.1, 0.9, by = 0.05)
+qr_all     <- rq(ncd_mortality_pct ~ alcohol_per_capita + gni_usd + suicide_rate +
+                   pm2_5 + air_pollution_mort + safe_water_pct,
+                 tau = taus_fine, data = data_ready)
+
+coef_df <- as.data.frame(t(coef(qr_all)))
+coef_df$tau <- taus_fine
+
+coef_long <- coef_df %>%
+  pivot_longer(cols = -tau, names_to = "Variable", values_to = "Coefficient")
+
+ggplot(coef_long, aes(x = tau, y = Coefficient, color = Variable)) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Coefficient Paths Across Quantiles",
+    x     = "Quantile (τ)",
+    y     = "Coefficient Value",
+    color = "Variable"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+
+# Descriptive Statistics
+
+```{r}
+#| label: descriptive_stats
+
+# Final descriptive statistics table for the seven variables used in the paper.
+# Uses the psych::describe() function for extended statistics (skewness, kurtosis, SE).
+
+selected_vars <- c(
+  "ncd_mortality_pct", "alcohol_per_capita", "gni_usd_by1000",
+  "suicide_rate", "pm2_5", "air_pollution_mort", "safe_water_pct"
+)
+
+descriptive_data <- data_ready %>% select(all_of(selected_vars))
+
+summary(descriptive_data)
+
+desc_stats          <- describe(descriptive_data)
+desc_stats$variable <- rownames(desc_stats)
+desc_stats          <- desc_stats %>% select(variable, everything())
+
+write_xlsx(
+  as.data.frame(desc_stats),
+  path = file.path(output_dir, "descriptive_stats.xlsx")
+)
+```
+
+
+# Save Clean Dataset
+
+```{r}
+#| label: save_clean_data
+
+# Export the analysis-ready dataset for transparency and reproducibility.
+# Saved alongside other outputs in the outputs/ folder.
+write_xlsx(data_ready, path = file.path(output_dir, "data_ready.xlsx"))
+```

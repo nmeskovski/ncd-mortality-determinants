@@ -1,0 +1,19 @@
+# R artefacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Quarto cache and render artefacts
+_freeze/
+_site/
+*.quarto/
+/.quarto/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Output files (regenerated on render — optional to commit)
+# Uncomment the line below if you prefer not to track generated outputs:
+# outputs/
