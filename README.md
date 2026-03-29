@@ -99,7 +99,7 @@ ncd-mortality-determinants/
 ├── .gitignore                                         # R/Quarto/OS artefacts
 │
 ├── Structural_Determinants_of_NCDs_Mortality_...pdf   # Full paper
-├── main_work-Project2.qmd                             # Quarto analysis file (R)
+├── main_code.qmd                                      # Quarto code - analysis file (R)
 ├── Data_dirty.xlsx                                    # Raw World Bank dataset
 │
 └── outputs/                                           # Auto-generated on render
