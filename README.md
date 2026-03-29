@@ -115,7 +115,7 @@ ncd-mortality-determinants/
 
 ---
 
-## How to Reproduce
+## How to Reproduce Analysis
 
 ### Requirements
 
@@ -125,11 +125,11 @@ ncd-mortality-determinants/
 ### Steps
 
 1. Clone or download this repository
-2. Place `Data_dirty.xlsx` in the **same directory** as `main_work-Project2.qmd`
+2. Place `Data_dirty.xlsx` in the **same directory** as `main_code.qmd`
 3. Open a terminal in that directory and run:
 
 ```bash
-quarto render main_work-Project2.qmd
+quarto render main_code.qmd
 ```
 
 4. All output files will be saved to the `outputs/` folder (created automatically)
